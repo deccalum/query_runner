@@ -37,6 +37,8 @@ namespace qr {
 using Param =
     std::variant<std::monostate, bool, int, int64_t, double, std::string, std::vector<std::byte>>;
 
+enum class oid : int64_t {};
+
 template <typename T>
 struct IsOptionalType : std::false_type {};
 
@@ -55,6 +57,25 @@ struct UnwrapOptional<std::optional<T>> {
 
 template <typename T>
 using unwrap_optional_t = typename UnwrapOptional<T>::type;
+
+template <typename T>
+struct IsNumericArray : std::false_type {};
+
+template <typename U>
+struct IsNumericArray<std::vector<U>> : std::bool_constant<std::is_arithmetic_v<U>> {};
+
+template <typename U>
+std::string pg_array_text(const std::vector<U>& values) {
+  std::string text = "{";
+  char digits[32];
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) text += ',';
+    const auto written = std::to_chars(digits, digits + sizeof(digits), values[i]);
+    text.append(digits, written.ptr);
+  }
+  text += '}';
+  return text;
+}
 
 /// The ADL hook qr looks for on an enum used as a column's value type.
 ///
@@ -148,7 +169,7 @@ inline std::string to_timestamp_text(std::chrono::system_clock::time_point tp) {
 
 // Decode side of to_timestamp_text — parses Postgres's
 // "YYYY-MM-DD HH:MM:SS[.ffffff]" text (the fraction is omitted when zero).
-inline std::chrono::system_clock::time_point parse_timestamp(std::string_view text) {
+inline std::chrono::system_clock::time_point parse_time_point(std::string_view text) {
   auto read_int = [&](size_t start, size_t len) {
     int value = 0;
     std::from_chars(text.data() + start, text.data() + start + len, value);
@@ -223,10 +244,14 @@ Param to_param(T value) {
     return Param{value};
   } else if constexpr (std::same_as<T, int64_t>) {
     return Param{value};
+  } else if constexpr (std::same_as<T, oid>) {
+    return Param{static_cast<int64_t>(value)};
   } else if constexpr (std::same_as<T, double>) {
     return Param{value};
   } else if constexpr (std::same_as<T, std::vector<std::byte>>) {
     return Param{std::move(value)};
+  } else if constexpr (IsNumericArray<T>::value) {
+    return Param{pg_array_text(value)};
   } else if constexpr (std::same_as<T, std::chrono::system_clock::time_point>) {
     return Param{to_timestamp_text(value)};
   } else if constexpr (std::convertible_to<T, std::string>) {

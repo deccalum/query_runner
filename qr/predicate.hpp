@@ -88,7 +88,7 @@ inline Predicate operator||(Predicate lhs, Predicate rhs) {
 template <typename TableT, typename T, typename U>
   requires std::constructible_from<unwrap_optional_t<T>, const U&>
 Predicate compare(const Column<TableT, T>& col, CompareOp op, const U& value) {
-  return Predicate{Comparison{ColumnRef{TableT::table_name, col.column_name}, op,
+  return Predicate{Comparison{ColumnRef{table_name_of<TableT>(), col.name()}, op,
                               to_param(static_cast<unwrap_optional_t<T>>(value))}};
 }
 
@@ -166,7 +166,7 @@ Predicate operator>=(const Column<TableT, T>& col, const U& value) {
 /// \endcode
 template <typename TableT, typename T>
 Predicate is_null(const Column<TableT, T>& col) {
-  return Predicate{IsNull{ColumnRef{TableT::table_name, col.column_name}, false}};
+  return Predicate{IsNull{ColumnRef{table_name_of<TableT>(), col.name()}, false}};
 }
 
 /// Same as `is_null`, negated — compiles to *IS NOT NULL*.
@@ -174,7 +174,7 @@ Predicate is_null(const Column<TableT, T>& col) {
 /// **Example:** `qr::is_not_null(Users::score)`
 template <typename TableT, typename T>
 Predicate is_not_null(const Column<TableT, T>& col) {
-  return Predicate{IsNull{ColumnRef{TableT::table_name, col.column_name}, true}};
+  return Predicate{IsNull{ColumnRef{table_name_of<TableT>(), col.name()}, true}};
 }
 
 template <typename T>
@@ -245,7 +245,7 @@ Predicate in(const Column<TableT, T>& col, const R& values) {
     append_array_element(literal, static_cast<Element>(v));
   }
   literal += '}';
-  return Predicate{AnyOf{ColumnRef{TableT::table_name, col.column_name}, pg_array_type<Element>(),
+  return Predicate{AnyOf{ColumnRef{table_name_of<TableT>(), col.name()}, pg_array_type<Element>(),
                          std::move(literal)}};
 }
 
@@ -274,8 +274,8 @@ struct ColumnEq {
 /// \endcode
 template <typename TableA, typename TableB, typename T>
 ColumnEq on(const Column<TableA, T>& a, const Column<TableB, T>& b) {
-  return ColumnEq{ColumnRef{TableA::table_name, a.column_name},
-                  ColumnRef{TableB::table_name, b.column_name}};
+  return ColumnEq{ColumnRef{table_name_of<TableA>(), a.name()},
+                  ColumnRef{table_name_of<TableB>(), b.name()}};
 }
 
 constexpr std::string_view op_symbol(CompareOp op) {
@@ -296,10 +296,16 @@ constexpr std::string_view op_symbol(CompareOp op) {
   std::unreachable();
 }
 
+inline void append_identifier(std::string& sql, std::string_view name) {
+  sql += '"';
+  sql += name;
+  sql += '"';
+}
+
 inline void append_column_ref(std::string& sql, const ColumnRef& ref) {
-  sql += ref.table_name;
+  append_identifier(sql, ref.table_name);
   sql += '.';
-  sql += ref.column_name;
+  append_identifier(sql, ref.column_name);
 }
 
 inline void compile_predicate(const Predicate& pred, std::string& sql, std::vector<Param>& params) {

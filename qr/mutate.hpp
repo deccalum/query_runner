@@ -77,7 +77,7 @@ class InsertQuery {
   template <typename T, typename U>
     requires std::constructible_from<T, U&&>
   InsertQuery& set(const Column<TableT, T>& col, U&& value) {
-    columns_.push_back(col.column_name);
+    columns_.push_back(col.name());
     values_.push_back(to_param(static_cast<T>(std::forward<U>(value))));
     return *this;
   }
@@ -87,7 +87,7 @@ class InsertQuery {
   /// **Example:** `qr::insert_into<Orders>().set(Orders::created_at, qr::now());`
   template <typename T>
   InsertQuery& set(const Column<TableT, T>& col, NowTag) {
-    columns_.push_back(col.column_name);
+    columns_.push_back(col.name());
     values_.push_back(NowTag{});
     return *this;
   }
@@ -110,7 +110,7 @@ class InsertQuery {
   /// \endcode
   template <typename... Ts>
   InsertQuery& on_conflict(const Column<TableT, Ts>&... cols) {
-    (conflict_target_.push_back(cols.column_name), ...);
+    (conflict_target_.push_back(cols.name()), ...);
     return *this;
   }
 
@@ -119,7 +119,7 @@ class InsertQuery {
   /// Only meaningful after `on_conflict()` — see its example above.
   template <typename T>
   InsertQuery& do_update(const Column<TableT, T>& col) {
-    conflict_updates_.push_back(ConflictUpdate{col.column_name, ExcludedTag{}});
+    conflict_updates_.push_back(ConflictUpdate{col.name(), ExcludedTag{}});
     return *this;
   }
 
@@ -139,7 +139,7 @@ class InsertQuery {
   /// \endcode
   template <typename T>
   InsertQuery& do_update(const Column<TableT, T>& col, NowTag) {
-    conflict_updates_.push_back(ConflictUpdate{col.column_name, NowTag{}});
+    conflict_updates_.push_back(ConflictUpdate{col.name(), NowTag{}});
     return *this;
   }
 
@@ -151,7 +151,7 @@ class InsertQuery {
   /// **Example:** `qr::insert_into<Users>().set(Users::name, "bob").returning(Users::id);`
   template <typename T>
   InsertQuery& returning(const Column<TableT, T>& col) {
-    returning_ = col.column_name;
+    returning_ = col.name();
     return *this;
   }
 
@@ -184,11 +184,11 @@ InsertQuery<TableT> insert_into() {
 template <typename TableT>
 CompiledQuery compile(InsertQuery<TableT> q) {
   std::string sql = "INSERT INTO ";
-  sql += TableT::table_name;
+  append_identifier(sql, table_name_of<TableT>());
   sql += " (";
   for (size_t i = 0; i < q.columns_.size(); ++i) {
     if (i > 0) sql += ", ";
-    sql += q.columns_[i];
+    append_identifier(sql, q.columns_[i]);
   }
   sql += ") VALUES (";
   std::vector<Param> params;
@@ -207,7 +207,7 @@ CompiledQuery compile(InsertQuery<TableT> q) {
     sql += " ON CONFLICT (";
     for (size_t i = 0; i < q.conflict_target_.size(); ++i) {
       if (i > 0) sql += ", ";
-      sql += q.conflict_target_[i];
+      append_identifier(sql, q.conflict_target_[i]);
     }
     sql += ')';
     if (q.conflict_updates_.empty()) {
@@ -216,20 +216,20 @@ CompiledQuery compile(InsertQuery<TableT> q) {
       sql += " DO UPDATE SET ";
       for (size_t i = 0; i < q.conflict_updates_.size(); ++i) {
         if (i > 0) sql += ", ";
-        sql += q.conflict_updates_[i].column;
+        append_identifier(sql, q.conflict_updates_[i].column);
         sql += " = ";
         if (std::holds_alternative<NowTag>(q.conflict_updates_[i].value)) {
           sql += "now()";
         } else {
           sql += "EXCLUDED.";
-          sql += q.conflict_updates_[i].column;
+          append_identifier(sql, q.conflict_updates_[i].column);
         }
       }
     }
   }
   if (q.returning_) {
     sql += " RETURNING ";
-    sql += *q.returning_;
+    append_identifier(sql, *q.returning_);
   }
   return CompiledQuery{std::move(sql), std::move(params)};
 }
@@ -249,7 +249,7 @@ CompiledQuery compile(InsertQuery<TableT> q) {
 template <typename TableT, typename... Cols>
 class BulkInsertQuery {
  public:
-  explicit BulkInsertQuery(Cols... cols) : columns_{cols.column_name...} {}
+  explicit BulkInsertQuery(Cols... cols) : columns_{cols.name()...} {}
 
   /// Appends one row.
   ///
@@ -299,11 +299,11 @@ BulkInsertQuery<TableT, Cols...> bulk_insert_into(Cols... cols) {
 template <typename TableT, typename... Cols>
 CompiledQuery compile(BulkInsertQuery<TableT, Cols...> q) {
   std::string sql = "INSERT INTO ";
-  sql += TableT::table_name;
+  append_identifier(sql, table_name_of<TableT>());
   sql += " (";
   for (size_t i = 0; i < q.columns_.size(); ++i) {
     if (i > 0) sql += ", ";
-    sql += q.columns_[i];
+    append_identifier(sql, q.columns_[i]);
   }
   sql += ") VALUES ";
 
@@ -350,7 +350,7 @@ class UpdateQuery {
   template <typename T, typename U>
     requires std::constructible_from<T, U&&>
   UpdateQuery& set(const Column<TableT, T>& col, U&& value) {
-    sets_.push_back(Assignment{col.column_name, to_param(static_cast<T>(std::forward<U>(value)))});
+    sets_.push_back(Assignment{col.name(), to_param(static_cast<T>(std::forward<U>(value)))});
     return *this;
   }
 
@@ -359,7 +359,7 @@ class UpdateQuery {
   /// **Example:** `qr::update<Orders>().set(Orders::updated_at, qr::now());`
   template <typename T>
   UpdateQuery& set(const Column<TableT, T>& col, NowTag) {
-    sets_.push_back(Assignment{col.column_name, NowTag{}});
+    sets_.push_back(Assignment{col.name(), NowTag{}});
     return *this;
   }
 
@@ -394,13 +394,13 @@ UpdateQuery<TableT> update() {
 template <typename TableT>
 CompiledQuery compile(const UpdateQuery<TableT>& q) {
   std::string sql = "UPDATE ";
-  sql += TableT::table_name;
+  append_identifier(sql, table_name_of<TableT>());
   sql += " SET ";
 
   std::vector<Param> params;
   for (size_t i = 0; i < q.sets_.size(); ++i) {
     if (i > 0) sql += ", ";
-    sql += q.sets_[i].column;
+    append_identifier(sql, q.sets_[i].column);
     sql += " = ";
     if (std::holds_alternative<NowTag>(q.sets_[i].value)) {
       sql += "now()";
@@ -461,7 +461,7 @@ DeleteQuery<TableT> delete_from() {
 template <typename TableT>
 CompiledQuery compile(const DeleteQuery<TableT>& q) {
   std::string sql = "DELETE FROM ";
-  sql += TableT::table_name;
+  append_identifier(sql, table_name_of<TableT>());
 
   std::vector<Param> params;
   if (q.where_) {

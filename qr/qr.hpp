@@ -8,8 +8,8 @@
 /// \code
 ///   struct Users {
 ///     static constexpr std::string_view table_name = "users";
-///     static constexpr qr::Column<Users, int64_t> id{"id"};
-///     static constexpr qr::Column<Users, std::string> name{"name"};
+///     static constexpr qr::Column<Users, int64_t> id{};
+///     static constexpr qr::Column<Users, std::string> name{};
 ///     static constexpr qr::Column<Users, std::optional<double>> score{"score"};
 ///   };
 ///
@@ -31,6 +31,7 @@
 ///   - predicate.hpp (*WHERE* clauses)
 ///   - select.hpp/mutate.hpp (the query builders)
 ///   - connection.hpp (running them)
+///   - stream.hpp (binary row output)
 ///   - compiled_query.hpp (the generated SQL, handy in tests).
 
 // IWYU pragma: begin_exports
@@ -39,6 +40,8 @@
 #include "qr/mutate.hpp"          // IWYU pragma: keep
 #include "qr/param.hpp"           // IWYU pragma: keep
 #include "qr/predicate.hpp"       // IWYU pragma: keep
+#include "qr/row.hpp"             // IWYU pragma: keep
 #include "qr/select.hpp"          // IWYU pragma: keep
+#include "qr/stream.hpp"          // IWYU pragma: keep
 #include "qr/table.hpp"           // IWYU pragma: keep
 // IWYU pragma: end_exports

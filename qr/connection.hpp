@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <pqxx/blob>
 #include <pqxx/pqxx>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -13,18 +16,11 @@
 
 #include "qr/mutate.hpp"
 #include "qr/param.hpp"
+#include "qr/predicate.hpp"
+#include "qr/row.hpp"
 #include "qr/select.hpp"
 
-namespace qr {
-
-// A numeric Postgres array column (`double precision[], integer[], ...`)
-// decoded into `std::vector<U>`. `std::byte` is not arithmetic so a `bytea`
-// `std::vector<std::byte>` column never matches, it stays on the pqxx `as<T>()`
-template <typename T>
-struct IsNumericArray : std::false_type {};
-
-template <typename U>
-struct IsNumericArray<std::vector<U>> : std::bool_constant<std::is_arithmetic_v<U>> {};
+namespace  qr {
 
 // Parse a Postgres array text literal like "{19.5,51,65}" (or "{}") into its
 // elements. Postgres emits numeric arrays without quoting, comma-separated.
@@ -53,27 +49,65 @@ T extract_field(const Field& f) {
   } else if constexpr (HasAdlFromString<T>) {
     return from_string(f.template as<std::string>(), std::type_identity<T>{});
   } else if constexpr (std::same_as<T, std::chrono::system_clock::time_point>) {
-    return parse_timestamp(f.template as<std::string>());
+    return parse_time_point(f.template as<std::string>());
   } else if constexpr (IsNumericArray<T>::value) {
     return parse_pg_array<typename T::value_type>(f.template as<std::string>());
+  } else if constexpr (std::same_as<T, oid>) {
+    return static_cast<oid>(f.template as<int64_t>());
   } else {
     return f.template as<T>();
   }
 }
 
+template <typename M, typename Field>
+void assign_field(M& target, const Field& field) {
+  if constexpr (IsOptionalType<M>::value) {
+    if (field.is_null()) {
+      target.reset();
+    } else {
+      target.emplace();
+      assign_field(*target, field);
+    }
+  } else if constexpr (std::is_class_v<M> && std::is_convertible_v<const M&, double>) {
+    target = extract_field<double>(field);
+  } else {
+    target = extract_field<M>(field);
+  }
+}
+
+#if QR_HAS_MEMBER_NAMES
+template <typename Row>
+struct field_assigner {
+  const Row& result_row;
+  int i = 0;
+
+  template <typename V>
+  void cell(V& value) {
+    assign_field(value, result_row[i]);
+    ++i;
+  }
+};
+
+template <typename T, typename Row>
+T decode_row(const Row& result_row) {
+  T row{};
+  field_assigner<Row> visit{result_row};
+  each_value(row, visit);
+  return row;
+}
+#endif
+
 inline pqxx::params to_pqxx_params(const std::vector<Param>& params) {
   pqxx::params out;
   out.reserve(params.size());
   for (const auto& p : params) {
-    std::visit(
-        [&](const auto& v) {
-          if constexpr (std::same_as<std::decay_t<decltype(v)>, std::monostate>) {
-            out.append();
-          } else {
-            out.append(v);
-          }
-        },
-        p);
+    std::visit([&](const auto& v) {
+      if constexpr (std::same_as<std::decay_t<decltype(v)>, std::monostate>) {
+        out.append();
+      } else {
+        out.append(v);
+      }
+    }, p);
   }
   return out;
 }
@@ -267,20 +301,144 @@ class Connection {
     return static_cast<std::size_t>(run(compile(query)).affected_rows());
   }
 
+  /// Reads a Large Object (as written by `lo_from_bytea`) into memory.
+  ///
+  /// Large Objects are read in chunks through libpq's binary fast-path, so
+  /// unlike a plain `bytea` column this has no text-protocol size limit —
+  /// use it for columns storing an `oid` too big to `SELECT` as `bytea`.
+  ///
+  /// **Example:**
+  /// \code
+  ///   std::vector<std::byte> audio = db.read_blob(row_oid);
+  /// \endcode
+  std::vector<std::byte> read_blob(oid id) {
+    pqxx::work tx(conn_);
+    pqxx::blob b = pqxx::blob::open_r(tx, static_cast<pqxx::oid>(id));
+    std::vector<std::byte> out;
+    pqxx::bytes chunk;
+    constexpr std::size_t kChunkSize = 8 * 1024 * 1024;
+    while (b.read(chunk, kChunkSize) > 0) out.insert(out.end(), chunk.begin(), chunk.end());
+    tx.commit();
+    return out;
+  }
+
+  oid write_blob(std::span<const std::byte> bytes) {
+    pqxx::work tx(conn_);
+    const pqxx::oid id = pqxx::blob::from_buf(tx, bytes);
+    tx.commit();
+    return static_cast<oid>(id);
+  }
+
+  void remove_blob(oid id) {
+    pqxx::work tx(conn_);
+    pqxx::blob::remove(tx, static_cast<pqxx::oid>(id));
+    tx.commit();
+  }
+
+  template <typename T>
+  void create();
+
+  template <typename T>
+  void insert(const T& row);
+
+  template <typename T>
+  void insert(const std::vector<T>& rows);
+
+  template <typename T>
+  void insert_missing(const std::vector<T>& rows);
+
+  template <typename T>
+  int64_t insert_returning(const T& row);
+
+  template <typename T>
+  void upsert(const T& row);
+
+  template <typename T>
+  std::vector<T> select();
+
+  template <typename T>
+  std::vector<T> select(Predicate where);
+
  private:
   template <typename... FieldTypes, typename Mapper, typename Row, size_t... I>
   static auto extract_row(const Row& row, Mapper&& mapper, std::index_sequence<I...>) {
     return mapper(extract_field<FieldTypes>(row[I])...);
   }
 
+  static pqxx::result exec(pqxx::work& tx, const CompiledQuery& compiled) {
+    return tx.exec(compiled.sql, to_pqxx_params(compiled.params));
+  }
+
   pqxx::result run(const CompiledQuery& compiled) {
     pqxx::work tx(conn_);
-    pqxx::result result = tx.exec(compiled.sql, to_pqxx_params(compiled.params));
+    pqxx::result result = exec(tx, compiled);
     tx.commit();
     return result;
   }
 
   pqxx::connection conn_;
 };
+
+#if QR_HAS_MEMBER_NAMES
+template <typename T>
+void Connection::create() {
+  run(compile_create<T>());
+}
+
+template <typename T>
+void Connection::insert(const T& row) {
+  run(compile_insert(std::span<const T>(&row, 1)));
+}
+
+template <typename T>
+void Connection::insert(const std::vector<T>& rows) {
+  const std::size_t chunk = insert_chunk<T>();
+  pqxx::work tx(conn_);
+  for (std::size_t first = 0; first < rows.size(); first += chunk) {
+    const std::size_t count = std::min(chunk, rows.size() - first);
+    exec(tx, compile_insert(std::span<const T>(rows).subspan(first, count)));
+  }
+  tx.commit();
+}
+
+template <typename T>
+void Connection::insert_missing(const std::vector<T>& rows) {
+  const std::size_t chunk = insert_chunk<T>();
+  pqxx::work tx(conn_);
+  for (std::size_t first = 0; first < rows.size(); first += chunk) {
+    const std::size_t count = std::min(chunk, rows.size() - first);
+    exec(tx, compile_insert_missing(std::span<const T>(rows).subspan(first, count)));
+  }
+  tx.commit();
+}
+
+template <typename T>
+int64_t Connection::insert_returning(const T& row) {
+  return run(compile_insert_returning(row)).one_field().template as<int64_t>();
+}
+
+template <typename T>
+void Connection::upsert(const T& row) {
+  run(compile_upsert(row));
+}
+
+template <typename T>
+std::vector<T> Connection::select() {
+  const pqxx::result result = run(compile_select<T>(std::nullopt));
+  std::vector<T> out;
+  out.reserve(result.size());
+  for (const auto& result_row : result) out.push_back(decode_row<T>(result_row));
+  return out;
+}
+
+template <typename T>
+std::vector<T> Connection::select(Predicate where) {
+  const pqxx::result result = run(compile_select<T>(std::move(where)));
+  std::vector<T> out;
+  out.reserve(result.size());
+  for (const auto& result_row : result) out.push_back(decode_row<T>(result_row));
+  return out;
+}
+#endif
 
 }  // namespace qr

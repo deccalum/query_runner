@@ -75,7 +75,7 @@ class SelectQuery {
   /// **Example:** `qr::select(Users::id).from<Users>();`
   template <typename TableT>
   SelectQuery& from() {
-    from_table_ = TableT::table_name;
+    from_table_ = table_name_of<TableT>();
     return *this;
   }
 
@@ -91,7 +91,7 @@ class SelectQuery {
   /// \endcode
   template <typename TableT>
   SelectQuery& join(ColumnEq on_clause) {
-    joins_.push_back(Join{TableT::table_name, on_clause});
+    joins_.push_back(Join{table_name_of<TableT>(), on_clause});
     return *this;
   }
 
@@ -121,7 +121,7 @@ class SelectQuery {
   /// \endcode
   template <typename TableT, typename T>
   SelectQuery& order_by(const Column<TableT, T>& col, SortDir dir = SortDir::Asc) {
-    order_by_.push_back(OrderTerm{ColumnRef{TableT::table_name, col.column_name}, dir});
+    order_by_.push_back(OrderTerm{ColumnRef{table_name_of<TableT>(), col.name()}, dir});
     return *this;
   }
 
@@ -161,7 +161,7 @@ void append_column_list(std::string& sql, const std::tuple<Cols...>& columns) {
   std::apply(
       [&](const auto&... cols) {
         ((sql += (first ? "" : ", "), first = false,
-          append_column_ref(sql, ColumnRef{cols.table_name(), cols.column_name})),
+          append_column_ref(sql, ColumnRef{cols.table_name(), cols.name()})),
          ...);
       },
       columns);
@@ -170,11 +170,11 @@ void append_column_list(std::string& sql, const std::tuple<Cols...>& columns) {
 template <typename... Cols>
 void append_source(std::string& sql, std::vector<Param>& params, const SelectQuery<Cols...>& q) {
   sql += " FROM ";
-  sql += q.from_table_;
+  append_identifier(sql, q.from_table_);
 
   for (const auto& j : q.joins_) {
     sql += " JOIN ";
-    sql += j.table;
+    append_identifier(sql, j.table);
     sql += " ON ";
     append_column_ref(sql, j.on.left);
     sql += " = ";

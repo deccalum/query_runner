@@ -1,2 +1,5 @@
 Documentation:
   CommentFormat: Doxygen
+
+CompileFlags:
+  Remove: [-freflection]
