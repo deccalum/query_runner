@@ -54,6 +54,8 @@ void write_present(std::FILE* out, const V& value) {
         write_number(out, static_cast<double>(each));
       }
     }
+  } else if constexpr (HasAdlToColumn<V>) {
+    write_present(out, to_column(value));
   } else if constexpr (HasAdlToString<V>) {
     write_text(out, to_string(value));
   } else if constexpr (std::is_integral_v<V> || std::is_enum_v<V>) {

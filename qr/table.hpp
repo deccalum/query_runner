@@ -20,6 +20,9 @@ inline constexpr key_t key{};
 struct serial_t {};
 inline constexpr serial_t serial{};
 
+struct cascade_t {};
+inline constexpr cascade_t cascade{};
+
 template <typename TableT>
 struct references_t {};
 template <typename TableT>
@@ -107,6 +110,7 @@ class Column {
     for (const detail::ColumnEntry<TableT, T>& entry : detail::column_entries<TableT, T>())
       if (entry.ptr == this) return entry.name;
 #endif
+    std::unreachable();
   }
 };
 
@@ -191,8 +195,10 @@ consteval auto static_members_of();
 #define QR_KEY [[=::qr::key]]
 #define QR_SERIAL [[=::qr::serial]]
 #define QR_REFERENCES(Table) [[=::qr::references<Table>]]
+#define QR_CASCADE [[=::qr::cascade]]
 #else
 #define QR_KEY
 #define QR_SERIAL
 #define QR_REFERENCES(Table)
+#define QR_CASCADE
 #endif

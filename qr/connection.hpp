@@ -5,13 +5,16 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <pqxx/blob>
 #include <pqxx/pqxx>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "qr/mutate.hpp"
@@ -46,6 +49,8 @@ T extract_field(const Field& f) {
   if constexpr (IsOptionalType<T>::value) {
     using Inner = typename T::value_type;
     return f.is_null() ? T{} : T{extract_field<Inner>(f)};
+  } else if constexpr (HasAdlFromColumn<T>) {
+    return from_column(extract_field<adl_column_t<T>>(f), std::type_identity<T>{});
   } else if constexpr (HasAdlFromString<T>) {
     return from_string(f.template as<std::string>(), std::type_identity<T>{});
   } else if constexpr (std::same_as<T, std::chrono::system_clock::time_point>) {
@@ -86,6 +91,34 @@ struct field_assigner {
     assign_field(value, result_row[i]);
     ++i;
   }
+
+  template <typename S>
+  void group(std::optional<S>& target) {
+    constexpr std::size_t width = detail::leaf_count<S>();
+    bool present = false;
+    for (std::size_t j = 0; j < width; ++j) present = present || !result_row[i + static_cast<int>(j)].is_null();
+    if (present) {
+      target.emplace();
+      each_value(*target, *this);
+    } else {
+      target.reset();
+      i += static_cast<int>(width);
+    }
+  }
+
+  template <typename... S>
+  void group(std::variant<S...>& target) {
+    template for (constexpr std::size_t k : std::views::iota(0uz, sizeof...(S))) {
+      constexpr std::size_t width = detail::leaf_count<std::variant_alternative_t<k, std::variant<S...>>>();
+      bool present = false;
+      for (std::size_t j = 0; j < width; ++j) present = present || !result_row[i + static_cast<int>(j)].is_null();
+      if (present) {
+        each_value(target.template emplace<k>(), *this);
+      } else {
+        i += static_cast<int>(width);
+      }
+    }
+  }
 };
 
 template <typename T, typename Row>
@@ -116,9 +149,8 @@ inline pqxx::params to_pqxx_params(const std::vector<Param>& params) {
 ///
 /// Construct one per process with a Postgres connection string, then pass
 /// query builders from select.hpp/mutate.hpp to its methods. Every call opens
-/// its own transaction and commits before returning — this project has no
-/// cross-call transaction needs yet, so a longer-lived transaction object
-/// isn't exposed as a seam.
+/// its own transaction and commits before returning, unless it runs inside
+/// `transaction()`, which commits every call in its body together.
 ///
 /// **Example:**
 /// \code
@@ -312,27 +344,51 @@ class Connection {
   ///   std::vector<std::byte> audio = db.read_blob(row_oid);
   /// \endcode
   std::vector<std::byte> read_blob(oid id) {
-    pqxx::work tx(conn_);
-    pqxx::blob b = pqxx::blob::open_r(tx, static_cast<pqxx::oid>(id));
     std::vector<std::byte> out;
-    pqxx::bytes chunk;
-    constexpr std::size_t kChunkSize = 8 * 1024 * 1024;
-    while (b.read(chunk, kChunkSize) > 0) out.insert(out.end(), chunk.begin(), chunk.end());
-    tx.commit();
+    within([&](pqxx::work& tx) {
+      pqxx::blob b = pqxx::blob::open_r(tx, static_cast<pqxx::oid>(id));
+      pqxx::bytes chunk;
+      constexpr std::size_t kChunkSize = 8 * 1024 * 1024;
+      while (b.read(chunk, kChunkSize) > 0) out.insert(out.end(), chunk.begin(), chunk.end());
+    });
+    return out;
+  }
+
+  std::vector<std::byte> read_blob_head(oid id, std::size_t length) {
+    std::vector<std::byte> out;
+    within([&](pqxx::work& tx) {
+      pqxx::blob b = pqxx::blob::open_r(tx, static_cast<pqxx::oid>(id));
+      pqxx::bytes head;
+      b.read(head, length);
+      out.assign(head.begin(), head.end());
+    });
     return out;
   }
 
   oid write_blob(std::span<const std::byte> bytes) {
-    pqxx::work tx(conn_);
-    const pqxx::oid id = pqxx::blob::from_buf(tx, bytes);
-    tx.commit();
+    pqxx::oid id;
+    within([&](pqxx::work& tx) {
+      id = pqxx::blob::create(tx);
+      pqxx::blob b = pqxx::blob::open_w(tx, id);
+      constexpr std::size_t kChunkSize = 8 * 1024 * 1024;
+      for (std::size_t offset = 0; offset < bytes.size(); offset += kChunkSize) {
+        const std::size_t length = std::min(kChunkSize, bytes.size() - offset);
+        b.write(bytes.subspan(offset, length));
+      }
+    });
     return static_cast<oid>(id);
   }
 
   void remove_blob(oid id) {
-    pqxx::work tx(conn_);
-    pqxx::blob::remove(tx, static_cast<pqxx::oid>(id));
-    tx.commit();
+    within([&](pqxx::work& tx) { pqxx::blob::remove(tx, static_cast<pqxx::oid>(id)); });
+  }
+
+  template <typename F>
+  void transaction(F&& body) {
+    open_.emplace(conn_);
+    body();
+    open_->commit();
+    open_.reset();
   }
 
   template <typename T>
@@ -359,6 +415,15 @@ class Connection {
   template <typename T>
   std::vector<T> select(Predicate where);
 
+  template <typename T>
+  std::vector<T> run_rows(const CompiledQuery& compiled);
+
+  pqxx::result run(const CompiledQuery& compiled) {
+    pqxx::result result;
+    within([&](pqxx::work& tx) { result = exec(tx, compiled); });
+    return result;
+  }
+
  private:
   template <typename... FieldTypes, typename Mapper, typename Row, size_t... I>
   static auto extract_row(const Row& row, Mapper&& mapper, std::index_sequence<I...>) {
@@ -369,14 +434,19 @@ class Connection {
     return tx.exec(compiled.sql, to_pqxx_params(compiled.params));
   }
 
-  pqxx::result run(const CompiledQuery& compiled) {
+  template <typename F>
+  void within(F&& step) {
+    if (open_) {
+      step(*open_);
+      return;
+    }
     pqxx::work tx(conn_);
-    pqxx::result result = exec(tx, compiled);
+    step(tx);
     tx.commit();
-    return result;
   }
 
   pqxx::connection conn_;
+  std::optional<pqxx::work> open_;
 };
 
 #if QR_HAS_MEMBER_NAMES
@@ -387,29 +457,29 @@ void Connection::create() {
 
 template <typename T>
 void Connection::insert(const T& row) {
-  run(compile_insert(std::span<const T>(&row, 1)));
+  run(compile_insert(std::span<const T>(&row, 1), false));
 }
 
 template <typename T>
 void Connection::insert(const std::vector<T>& rows) {
   const std::size_t chunk = insert_chunk<T>();
-  pqxx::work tx(conn_);
-  for (std::size_t first = 0; first < rows.size(); first += chunk) {
-    const std::size_t count = std::min(chunk, rows.size() - first);
-    exec(tx, compile_insert(std::span<const T>(rows).subspan(first, count)));
-  }
-  tx.commit();
+  within([&](pqxx::work& tx) {
+    for (std::size_t first = 0; first < rows.size(); first += chunk) {
+      const std::size_t count = std::min(chunk, rows.size() - first);
+      exec(tx, compile_insert(std::span<const T>(rows).subspan(first, count), false));
+    }
+  });
 }
 
 template <typename T>
 void Connection::insert_missing(const std::vector<T>& rows) {
   const std::size_t chunk = insert_chunk<T>();
-  pqxx::work tx(conn_);
-  for (std::size_t first = 0; first < rows.size(); first += chunk) {
-    const std::size_t count = std::min(chunk, rows.size() - first);
-    exec(tx, compile_insert_missing(std::span<const T>(rows).subspan(first, count)));
-  }
-  tx.commit();
+  within([&](pqxx::work& tx) {
+    for (std::size_t first = 0; first < rows.size(); first += chunk) {
+      const std::size_t count = std::min(chunk, rows.size() - first);
+      exec(tx, compile_insert_missing(std::span<const T>(rows).subspan(first, count)));
+    }
+  });
 }
 
 template <typename T>
@@ -423,21 +493,25 @@ void Connection::upsert(const T& row) {
 }
 
 template <typename T>
-std::vector<T> Connection::select() {
-  const pqxx::result result = run(compile_select<T>(std::nullopt));
+std::vector<T> Connection::run_rows(const CompiledQuery& compiled) {
+  const pqxx::result result = run(compiled);
   std::vector<T> out;
   out.reserve(result.size());
-  for (const auto& result_row : result) out.push_back(decode_row<T>(result_row));
+  for (const auto& result_row : result) {
+    if constexpr (is_column_value<T>()) out.push_back(extract_field<T>(result_row[0]));
+    else out.push_back(decode_row<T>(result_row));
+  }
   return out;
 }
 
 template <typename T>
+std::vector<T> Connection::select() {
+  return run_rows<T>(compile_select<T>(std::nullopt));
+}
+
+template <typename T>
 std::vector<T> Connection::select(Predicate where) {
-  const pqxx::result result = run(compile_select<T>(std::move(where)));
-  std::vector<T> out;
-  out.reserve(result.size());
-  for (const auto& result_row : result) out.push_back(decode_row<T>(result_row));
-  return out;
+  return run_rows<T>(compile_select<T>(std::move(where)));
 }
 #endif
 

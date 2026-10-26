@@ -41,6 +41,7 @@
 #include "qr/param.hpp"           // IWYU pragma: keep
 #include "qr/predicate.hpp"       // IWYU pragma: keep
 #include "qr/row.hpp"             // IWYU pragma: keep
+#include "qr/schema.hpp"          // IWYU pragma: keep
 #include "qr/select.hpp"          // IWYU pragma: keep
 #include "qr/stream.hpp"          // IWYU pragma: keep
 #include "qr/table.hpp"           // IWYU pragma: keep

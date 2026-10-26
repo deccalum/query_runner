@@ -46,6 +46,12 @@ template <typename T>
 struct IsOptionalType<std::optional<T>> : std::true_type {};
 
 template <typename T>
+struct IsVariantType : std::false_type {};
+
+template <typename... T>
+struct IsVariantType<std::variant<T...>> : std::true_type {};
+
+template <typename T>
 struct UnwrapOptional {
   using type = T;
 };
@@ -108,6 +114,17 @@ concept HasAdlFromString = requires(std::string_view s) {
   { from_string(s, std::type_identity<T>{}) } -> std::same_as<T>;
 };
 
+template <typename T>
+concept HasAdlToColumn = requires(const T& v) { to_column(v); };
+
+template <typename T>
+using adl_column_t = decltype(to_column(std::declval<const T&>()));
+
+template <typename T>
+concept HasAdlFromColumn = HasAdlToColumn<T> && requires(adl_column_t<T> v) {
+  { from_column(v, std::type_identity<T>{}) } -> std::same_as<T>;
+};
+
 // Civil calendar <-> days-since-epoch, per Howard Hinnant's public-domain
 // algorithm (http://howardhinnant.github.io/date_algorithms.html). Used
 // instead of gmtime/strftime/strptime because those are POSIX extensions
@@ -158,7 +175,7 @@ inline std::string to_timestamp_text(std::chrono::system_clock::time_point tp) {
   // The trailing +00 is not decoration: a timestamptz input without an offset is
   // interpreted in the session's TimeZone, so omitting it would silently shift
   // the stored instant on any connection that is not UTC.
-  char out[48];
+  char out[64];
   std::snprintf(out, sizeof(out), "%04lld-%02u-%02u %02lld:%02lld:%02lld.%06lld+00",
                 static_cast<long long>(y), m, d, static_cast<long long>(hours_part.count()),
                 static_cast<long long>(minutes_part.count()),
@@ -248,6 +265,10 @@ Param to_param(T value) {
     return Param{static_cast<int64_t>(value)};
   } else if constexpr (std::same_as<T, double>) {
     return Param{value};
+  } else if constexpr (std::floating_point<T>) {
+    return Param{static_cast<double>(value)};
+  } else if constexpr (std::integral<T>) {
+    return Param{static_cast<int64_t>(value)};
   } else if constexpr (std::same_as<T, std::vector<std::byte>>) {
     return Param{std::move(value)};
   } else if constexpr (IsNumericArray<T>::value) {
@@ -256,6 +277,8 @@ Param to_param(T value) {
     return Param{to_timestamp_text(value)};
   } else if constexpr (std::convertible_to<T, std::string>) {
     return Param{std::string(std::move(value))};
+  } else if constexpr (HasAdlToColumn<T>) {
+    return to_param(to_column(value));
   } else if constexpr (HasAdlToString<T>) {
     return Param{std::string(to_string(value))};
   } else {

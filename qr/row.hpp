@@ -5,10 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <variant>
 #include <vector>
 
 #include "qr/compiled_query.hpp"
@@ -35,7 +37,7 @@ constexpr bool is_column_value() {
   using U = unwrap_optional_t<T>;
   return std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> ||
          std::same_as<U, std::vector<std::byte>> || IsNumericArray<U>::value ||
-         std::same_as<U, std::chrono::system_clock::time_point> ||
+         std::same_as<U, std::chrono::system_clock::time_point> || HasAdlToColumn<U> ||
          std::is_convertible_v<const U&, double>;
 }
 
@@ -48,6 +50,8 @@ constexpr std::string_view sql_type() {
     return "int4";
   } else if constexpr (std::same_as<U, int64_t>) {
     return "int8";
+  } else if constexpr (std::integral<U>) {
+    return "int8";
   } else if constexpr (std::same_as<U, oid>) {
     return "oid";
   } else if constexpr (std::same_as<U, std::string>) {
@@ -58,6 +62,8 @@ constexpr std::string_view sql_type() {
     return "timestamptz";
   } else if constexpr (IsNumericArray<U>::value) {
     return pg_array_type<typename U::value_type>();
+  } else if constexpr (HasAdlToColumn<U>) {
+    return sql_type<adl_column_t<U>>();
   } else if constexpr (HasAdlToString<U>) {
     return "text";
   } else if constexpr (std::is_convertible_v<const U&, double>) {
@@ -85,6 +91,7 @@ struct ColumnSpec {
   bool key;
   bool serial;
   std::string_view references;
+  bool cascade;
   std::string_view unit;
 };
 
@@ -104,17 +111,19 @@ consteval std::string_view member_name() {
   return name;
 }
 
-template <typename M>
+template <typename T>
 consteval std::string_view unit_of() {
+  using M = unwrap_optional_t<T>;
+  constexpr std::meta::info plain = std::meta::dealias(^^M);
   if constexpr (std::is_class_v<M> && std::is_convertible_v<const M&, double> &&
-                std::meta::has_template_arguments(^^M)) {
-    return std::define_static_string(std::meta::identifier_of(std::meta::template_of(^^M)));
+                std::meta::has_template_arguments(plain)) {
+    return std::define_static_string(std::meta::identifier_of(std::meta::template_of(plain)));
   } else {
     return {};
   }
 }
 
-template <typename Tag>
+template <typename Tag = key_t>
 consteval bool annotated(std::meta::info member) {
   for (std::meta::info note : std::meta::annotations_of(member)) {
     if (std::meta::is_same_type(std::meta::remove_const(std::meta::type_of(note)), ^^Tag)) return true;
@@ -138,8 +147,14 @@ template <typename M>
 consteval std::size_t member_leaf_count() {
   if constexpr (is_column_value<M>()) {
     return 1;
+  } else if constexpr (IsVariantType<M>::value) {
+    std::size_t count = 0;
+    template for (constexpr std::size_t i : std::views::iota(0uz, std::variant_size_v<M>)) {
+      count += leaf_count<std::variant_alternative_t<i, M>>();
+    }
+    return count;
   } else {
-    return leaf_count<M>();
+    return leaf_count<unwrap_optional_t<M>>();
   }
 }
 
@@ -169,7 +184,21 @@ void collect_member(std::vector<ColumnSpec>& columns, const std::string& prefix)
     }
     columns.push_back(ColumnSpec{name, sql_type<M>(), IsOptionalType<M>::value,
                                  annotated<key_t>(member), annotated<serial_t>(member), references,
+                                 annotated<cascade_t>(member),
                                  unit_of<M>()});
+  } else if constexpr (IsOptionalType<M>::value) {
+    const std::size_t first = columns.size();
+    collect<typename M::value_type>(columns, name + "_");
+    for (std::size_t i = first; i < columns.size(); ++i) columns[i].nullable = true;
+  } else if constexpr (IsVariantType<M>::value) {
+    const std::size_t first = columns.size();
+    template for (constexpr std::size_t i : std::views::iota(0uz, std::variant_size_v<M>)) {
+      using Alternative = std::variant_alternative_t<i, M>;
+      const std::string owner = std::define_static_string(
+        std::meta::identifier_of(std::meta::parent_of(std::meta::dealias(^^Alternative))));
+      collect<Alternative>(columns, name + "_" + owner + "_");
+    }
+    for (std::size_t i = first; i < columns.size(); ++i) columns[i].nullable = true;
   } else {
     collect<M>(columns, name + "_");
   }
@@ -205,6 +234,25 @@ const std::vector<ColumnSpec>& columns_of() {
 template <typename T, typename F>
 void each_value(T& row, F& visit);
 
+template <typename T, typename F>
+void each_null(F& visit) {
+  template for (constexpr std::meta::info base : detail::bases_of<T>()) {
+    each_null<typename [:std::meta::type_of(base):]>(visit);
+  }
+  template for (constexpr std::meta::info member : detail::nonstatic_members_of<T>()) {
+    if constexpr (is_column_value<typename [:std::meta::type_of(member):]>()) {
+      visit.cell(std::optional<unwrap_optional_t<typename [:std::meta::type_of(member):]>>{});
+    } else if constexpr (IsVariantType<typename [:std::meta::type_of(member):]>::value) {
+      using Member = typename [:std::meta::type_of(member):];
+      template for (constexpr std::size_t i : std::views::iota(0uz, std::variant_size_v<Member>)) {
+        each_null<std::variant_alternative_t<i, Member>>(visit);
+      }
+    } else {
+      each_null<unwrap_optional_t<typename [:std::meta::type_of(member):]>>(visit);
+    }
+  }
+}
+
 template <typename B, typename T, typename F>
 void each_base_value(T& row, F& visit) {
   using Ref = std::conditional_t<std::is_const_v<T>, const B&, B&>;
@@ -220,6 +268,23 @@ void each_value(T& row, F& visit) {
   template for (constexpr std::meta::info member : detail::nonstatic_members_of<Plain>()) {
     if constexpr (is_column_value<typename [:std::meta::type_of(member):]>()) {
       visit.cell(row.[:member:]);
+    } else if constexpr (IsVariantType<typename [:std::meta::type_of(member):]>::value) {
+      using Member = typename [:std::meta::type_of(member):];
+      if constexpr (std::is_const_v<T>) {
+        template for (constexpr std::size_t i : std::views::iota(0uz, std::variant_size_v<Member>)) {
+          if (row.[:member:].index() == i) each_value(std::get<i>(row.[:member:]), visit);
+          else each_null<std::variant_alternative_t<i, Member>>(visit);
+        }
+      } else {
+        visit.group(row.[:member:]);
+      }
+    } else if constexpr (IsOptionalType<typename [:std::meta::type_of(member):]>::value) {
+      if constexpr (std::is_const_v<T>) {
+        if (row.[:member:]) each_value(*row.[:member:], visit);
+        else each_null<typename [:std::meta::type_of(member):]::value_type>(visit);
+      } else {
+        visit.group(row.[:member:]);
+      }
     } else {
       each_value(row.[:member:], visit);
     }
@@ -265,6 +330,7 @@ CompiledQuery compile_create() {
       append_identifier(references, column.name);
       references += ") REFERENCES ";
       append_identifier(references, column.references);
+      if (column.cascade) references += " ON DELETE CASCADE";
     }
   }
   if (!key.empty()) {
@@ -280,19 +346,20 @@ CompiledQuery compile_create() {
 struct insert_params {
   const std::vector<ColumnSpec>& columns;
   std::vector<Param>& params;
+  bool serial;
   std::size_t i = 0;
 
   template <typename V>
   void cell(const V& value) {
-    if (!columns[i].serial) params.push_back(column_param(value));
+    if (serial || !columns[i].serial) params.push_back(column_param(value));
     ++i;
   }
 };
 
 template <typename T>
-CompiledQuery compile_insert(std::span<const T> rows) {
+CompiledQuery compile_insert(std::span<const T> rows, bool serial) {
   const std::vector<ColumnSpec>& columns = columns_of<T>();
-  const std::size_t width = insert_width<T>();
+  const std::size_t width = serial ? columns.size() : insert_width<T>();
   std::string sql = "INSERT INTO ";
   append_identifier(sql, table_name_of<T>());
   if (width == 0) {
@@ -302,12 +369,12 @@ CompiledQuery compile_insert(std::span<const T> rows) {
   sql += " (";
   bool first = true;
   for (const ColumnSpec& column : columns) {
-    if (column.serial) continue;
+    if (!serial && column.serial) continue;
     if (!first) sql += ", ";
     first = false;
     append_identifier(sql, column.name);
   }
-  sql += ") VALUES ";
+  sql += serial && width != insert_width<T>() ? ") OVERRIDING SYSTEM VALUE VALUES " : ") VALUES ";
 
   std::vector<Param> params;
   for (std::size_t r = 0; r < rows.size(); ++r) {
@@ -319,7 +386,7 @@ CompiledQuery compile_insert(std::span<const T> rows) {
       sql += std::to_string(params.size() + c + 1);
     }
     sql += ')';
-    insert_params visit{columns, params};
+    insert_params visit{columns, params, serial};
     each_value(rows[r], visit);
   }
   return CompiledQuery{std::move(sql), std::move(params)};
@@ -327,7 +394,7 @@ CompiledQuery compile_insert(std::span<const T> rows) {
 
 template <typename T>
 CompiledQuery compile_insert_returning(const T& row) {
-  CompiledQuery query = compile_insert(std::span<const T>(&row, 1));
+  CompiledQuery query = compile_insert(std::span<const T>(&row, 1), false);
   std::string returning;
   for (const ColumnSpec& column : columns_of<T>()) {
     if (!column.serial) continue;
@@ -341,7 +408,7 @@ CompiledQuery compile_insert_returning(const T& row) {
 
 template <typename T>
 CompiledQuery compile_upsert(const T& row) {
-  CompiledQuery query = compile_insert(std::span<const T>(&row, 1));
+  CompiledQuery query = compile_insert(std::span<const T>(&row, 1), true);
   std::string target;
   std::string update;
   for (const ColumnSpec& column : columns_of<T>()) {
@@ -364,7 +431,7 @@ CompiledQuery compile_upsert(const T& row) {
 
 template <typename T>
 CompiledQuery compile_insert_missing(std::span<const T> rows) {
-  CompiledQuery query = compile_insert(rows);
+  CompiledQuery query = compile_insert(rows, false);
   std::string target;
   for (const ColumnSpec& column : columns_of<T>()) {
     if (!column.key) continue;
